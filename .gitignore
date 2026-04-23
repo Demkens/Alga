@@ -1,7 +1,7 @@
 # 忽略 日志、临时、脚本编译 文件夹
 logs/
 Tempopary/
-**/__pycache__/
+*/Database/
 
 # 忽略 Demo.py 文件
 Demo.py
