@@ -1,21 +1,25 @@
 from datetime import datetime, timedelta
+import warnings
 
 import akshare as ak
 import matplotlib.pyplot as plt
 import pandas as pd
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+warnings.filterwarnings('ignore', category=UserWarning, module='akshare')  # 屏蔽akshare日期解析警告
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Database')  # 缓存文件夹路径
 CACHE_EXPIRE_DAYS = 1  # 缓存有效期（天）
+MAX_THREADS = 10  # 最大线程数
 
 def save_fund_cache(fund_code, df):
     """保存基金数据到缓存文件"""
-    if not os.path.exists(CACHE_DIR):
-        os.makedirs(CACHE_DIR)  # 创建缓存目录（如果不存在）
+    if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)  # 创建缓存目录（如果不存在）
     cache_file = os.path.join(CACHE_DIR, f'{fund_code}.pkl')
     cache_data = {
         'df': df,  # 基金数据
@@ -31,8 +35,8 @@ def load_fund_cache(fund_code):
     
     cache_data = pd.read_pickle(cache_file)  # 反序列化读取缓存
     cache_time = cache_data['cache_time']  # 获取缓存保存时间
-    # 检查缓存是否过期：当前时间 - 缓存时间 > 缓存有效期
-    if (datetime.now() - cache_time).days >= CACHE_EXPIRE_DAYS:
+    # 如果缓存保存日期 < 当前日期，则认为已过期
+    if cache_time.date() < datetime.now().date():
         return None  # 缓存已过期
     
     return cache_data['df']  # 返回缓存的基金数据
@@ -66,6 +70,12 @@ def get_fund_data(fund_code):
 
         # 复利方式计算年化收益率
         df['年化收益率'] = ((1 + df['每万份收益'] / 10000).cumprod() - 1) * 100
+        
+        # 过滤异常数据：年化收益率超过100%的基金可能是数据异常（如万元收益实际是净值）
+        max_reasonable_rate = 100.0  # 货币基金年化收益率正常范围约1%-5%，上限设为100%
+        if df['年化收益率'].iloc[-1] > max_reasonable_rate:
+            print(f"{fund_code}: 数据异常（年化收益率 {df['年化收益率'].iloc[-1]:.2f}%）")
+            return None
 
         # 保存数据到缓存
         save_fund_cache(fund_code, df)
@@ -75,47 +85,131 @@ def get_fund_data(fund_code):
         print(f"异常: {type(e).__name__}: {e}")
         return None
 
-def main():
-    codes_input = input("请输入基金代码（逗号分隔）：").strip()
-    if not codes_input:
-        print("错误：未输入基金代码")
-        return
+def fetch_fund_rate(code):
+    """多线程获取单只基金数据，用于update_mode中的并行获取"""
+    df = get_fund_data(code)
+    if df is None or df.empty:
+        return None
+    latest = df.iloc[-1]
+    return {
+        'code': code,
+        'date': latest['净值日期'],
+        'rate': latest['年化收益率'],
+        'df': df
+    }
 
-    fund_codes = [c.strip() for c in codes_input.split(",") if c.strip()]
-    if not fund_codes:
-        print("错误：未输入有效的基金代码")
+def update_mode():
+    """更新模式：获取所有货币基金列表，选取年化收益率最高的前5位对比显示"""
+    print("正在获取所有货币基金列表...")
+    try:
+        all_funds = ak.fund_money_fund_daily_em()  # 获取所有货币基金列表
+        if all_funds is None or all_funds.empty:
+            print("错误：无法获取货币基金列表")
+            return
+        fund_codes = all_funds['基金代码'].tolist()  # 提取基金代码列表
+        print(f"发现 {len(fund_codes)} 只货币基金，开始获取年化收益率...")
+    except Exception as e:
+        print(f"异常: {type(e).__name__}: {e}")
         return
-
+    
+    fund_rates = []
+    count = 0
+    
+    # 使用多线程并行获取基金数据
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        future_to_code = {executor.submit(fetch_fund_rate, code): code for code in fund_codes}
+        for future in as_completed(future_to_code):
+            result = future.result()
+            if result is not None:
+                fund_rates.append(result)
+            count += 1
+            if count % 50 == 0:
+                print(f"已处理 {count} 只基金...")
+    
+    if not fund_rates:
+        print("错误：无可用基金数据")
+        return
+    
+    fund_rates.sort(key=lambda x: x['rate'], reverse=True)
+    top5 = fund_rates[:5]
+    
+    print("\n=== 货币基金年化收益率排名前5 ===")
+    for i, fund in enumerate(top5, 1):
+        print(f"第{i}名: {fund['code']} | 年化收益率: {fund['rate']:.4f}% | 最新日期: {fund['date'].strftime('%Y-%m-%d')}")
+    
     fig, ax = plt.subplots(figsize=(12, 8))
-
-    for code in fund_codes:
-        print(f"正在获取 {code} ...")
-        df = get_fund_data(code)
-        if df is None or df.empty:
-            print(f"{code} 数据获取失败")
-            continue
-
-        ax.plot(df['净值日期'], df['年化收益率'], label=code, linewidth=1.5)
-        latest = df.iloc[-1]
-        # 在最新数据点标注年化收益率数值
-        ax.annotate(f'{latest["年化收益率"]:.3f}%', 
-                    xy=(latest['净值日期'], latest['年化收益率']),
+    colors = ['red', 'blue', 'green', 'orange', 'purple']
+    
+    for i, fund in enumerate(top5):
+        ax.plot(fund['df']['净值日期'], fund['df']['年化收益率'], 
+                label=fund['code'], linewidth=1.5, color=colors[i])
+        ax.annotate(f"{fund['rate']:.3f}%", 
+                    xy=(fund['date'], fund['rate']),
                     xytext=(10, 10), textcoords='offset points',
-                    fontsize=9, color='blue',
-                    arrowprops=dict(arrowstyle='->', color='blue', lw=0.5))
-        print(f"{code}: 最新日期 {latest['净值日期'].strftime('%Y-%m-%d')}, "
-              f"每万份收益 {latest['每万份收益']:.4f}, "
-              f"年化收益率 {latest['年化收益率']:.4f}%")
-
-    ax.set_title("货币基金年化收益率走势", fontsize=14)
+                    fontsize=9, color=colors[i],
+                    arrowprops=dict(arrowstyle='->', color=colors[i], lw=0.5))
+    
+    ax.set_title("货币基金年化收益率 TOP5 走势", fontsize=14)
     ax.set_xlabel("日期")
     ax.set_ylabel("年化收益率 (%)")
-    if ax.get_legend_handles_labels()[1]:
-        ax.legend()
+    ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
+def main():
+    print("=" * 40)
+    print("货币基金年化收益率对比工具")
+    print("=" * 40)
+    print("1. 自填模式：手动输入基金代码进行对比")
+    print("2. 更新模式：自动获取全市场货币基金，取年化收益率前5名")
+    print("=" * 40)
+    
+    mode = input("请选择模式（1/2）：").strip()
+    
+    if mode == '1':
+        codes_input = input("请输入基金代码（逗号分隔）：").strip()
+        if not codes_input:
+            print("错误：未输入基金代码")
+            return
+
+        fund_codes = [c.strip() for c in codes_input.split(",") if c.strip()]
+        if not fund_codes:
+            print("错误：未输入有效的基金代码")
+            return
+
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        for code in fund_codes:
+            print(f"正在获取 {code} ...")
+            df = get_fund_data(code)
+            if df is None or df.empty:
+                print(f"{code} 数据获取失败")
+                continue
+
+            ax.plot(df['净值日期'], df['年化收益率'], label=code, linewidth=1.5)
+            latest = df.iloc[-1]
+            ax.annotate(f'{latest["年化收益率"]:.3f}%', 
+                        xy=(latest['净值日期'], latest['年化收益率']),
+                        xytext=(10, 10), textcoords='offset points',
+                        fontsize=9, color='blue',
+                        arrowprops=dict(arrowstyle='->', color='blue', lw=0.5))
+            print(f"{code}: 最新日期 {latest['净值日期'].strftime('%Y-%m-%d')}, "
+                  f"每万份收益 {latest['每万份收益']:.4f}, "
+                  f"年化收益率 {latest['年化收益率']:.4f}%")
+
+        ax.set_title("货币基金年化收益率走势", fontsize=14)
+        ax.set_xlabel("日期")
+        ax.set_ylabel("年化收益率 (%)")
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    elif mode == '2':
+        update_mode()
+    else:
+        print("无效的选择，请输入 1 或 2")
 
 if __name__ == "__main__":
     # print("AKshare安装成功, 版本号:", ak.__version__)
