@@ -1,14 +1,14 @@
-from datetime import datetime, timedelta
+import os
 import warnings
-
 import akshare as ak
 import matplotlib.pyplot as plt
 import pandas as pd
 
-import os
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-warnings.filterwarnings('ignore', category=UserWarning, module='akshare')  # 屏蔽akshare日期解析警告
+# 屏蔽akshare日期解析警告
+warnings.filterwarnings('ignore', category=UserWarning, module='akshare')  
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
@@ -16,16 +16,6 @@ plt.rcParams['axes.unicode_minus'] = False
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Database')  # 缓存文件夹路径
 CACHE_EXPIRE_DAYS = 1  # 缓存有效期（天）
 MAX_THREADS = 10  # 最大线程数
-
-def save_fund_cache(fund_code, df):
-    """保存基金数据到缓存文件"""
-    if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)  # 创建缓存目录（如果不存在）
-    cache_file = os.path.join(CACHE_DIR, f'{fund_code}.pkl')
-    cache_data = {
-        'df': df,  # 基金数据
-        'cache_time': datetime.now()  # 缓存时间
-    }
-    pd.to_pickle(cache_data, cache_file)  # 使用pandas序列化保存
 
 def load_fund_cache(fund_code):
     """从缓存文件加载基金数据，若缓存不存在或已过期则返回None"""
@@ -40,6 +30,16 @@ def load_fund_cache(fund_code):
         return None  # 缓存已过期
     
     return cache_data['df']  # 返回缓存的基金数据
+
+def save_fund_cache(fund_code, df):
+    """保存基金数据到缓存文件"""
+    if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)  # 创建缓存目录（如果不存在）
+    cache_file = os.path.join(CACHE_DIR, f'{fund_code}.pkl')
+    cache_data = {
+        'df': df,  # 基金数据
+        'cache_time': datetime.now()  # 缓存时间
+    }
+    pd.to_pickle(cache_data, cache_file)  # 使用pandas序列化保存
 
 def get_fund_data(fund_code):
     # 尝试从缓存加载数据
