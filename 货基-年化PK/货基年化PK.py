@@ -1,8 +1,21 @@
 import os
 import warnings
+os.environ['TQDM_DISABLE'] = '1'  # 全局禁用tqdm进度条
+os.environ['PYCHARM_HOSTED'] = '1'  # 避免 tqdm 在某些环境下的特殊处理
+
 import akshare as ak
 import matplotlib.pyplot as plt
 import pandas as pd
+
+try:
+    import tqdm
+    original_init = tqdm.tqdm.__init__
+    def disabled_init(self, *args, **kwargs):
+        kwargs['disable'] = kwargs.get('disable', True)
+        return original_init(self, *args, **kwargs)
+    tqdm.tqdm.__init__ = disabled_init
+except (ImportError, AttributeError):
+    pass
 
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +29,20 @@ plt.rcParams['axes.unicode_minus'] = False
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Database')  # 缓存文件夹路径
 CACHE_EXPIRE_DAYS = 1  # 缓存有效期（天）
 MAX_THREADS = 10  # 最大线程数
+BLACKLIST_FILE = os.path.join(CACHE_DIR, 'blacklist.txt')  # 黑名单文件路径
+
+def load_fund_blacklist():
+    """从黑名单文件加载基金代码列表，文件不存在或读取失败时返回空集合"""
+    if not os.path.exists(BLACKLIST_FILE):
+        return set()  # 黑名单文件不存在，返回空集合
+    try:
+        with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
+            # 读取所有行，去除空白字符，跳过空行
+            blacklist = {line.strip() for line in f if line.strip()}
+        return blacklist
+    except Exception as e:
+        print(f"警告: 读取黑名单文件失败: {type(e).__name__}: {e}")
+        return set()  # 读取失败，返回空集合
 
 def load_fund_cache(fund_code):
     """从缓存文件加载基金数据，若缓存不存在或已过期则返回None"""
@@ -42,6 +69,12 @@ def save_fund_cache(fund_code, df):
     pd.to_pickle(cache_data, cache_file)  # 使用pandas序列化保存
 
 def get_fund_data(fund_code):
+    # 检查是否在黑名单中
+    blacklist = load_fund_blacklist()
+    if fund_code in blacklist:
+        print(f"{fund_code}: 该基金在黑名单中，已跳过")
+        return None
+    
     # 尝试从缓存加载数据
     df = load_fund_cache(fund_code)
     if df is not None:
