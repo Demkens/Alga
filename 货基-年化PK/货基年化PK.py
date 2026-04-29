@@ -1,12 +1,19 @@
 import os
 import warnings
-os.environ['TQDM_DISABLE'] = '1'  # 全局禁用tqdm进度条
-os.environ['PYCHARM_HOSTED'] = '1'  # 避免 tqdm 在某些环境下的特殊处理
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
 
 import akshare as ak
 import matplotlib.pyplot as plt
 import pandas as pd
 
+os.environ['TQDM_DISABLE'] = '1'
+os.environ['PYCHARM_HOSTED'] = '1'
+
+# 屏蔽tqdm进度条的disable参数
 try:
     import tqdm
     original_init = tqdm.tqdm.__init__
@@ -17,172 +24,193 @@ try:
 except (ImportError, AttributeError):
     pass
 
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# 屏蔽akshare日期解析警告
-warnings.filterwarnings('ignore', category=UserWarning, module='akshare')  
+warnings.filterwarnings('ignore', category=UserWarning, module='akshare')
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Database')  # 缓存文件夹路径
-CACHE_EXPIRE_DAYS = 1  # 缓存有效期（天）
-MAX_THREADS = 10  # 最大线程数
-BLACKLIST_FILE = os.path.join(CACHE_DIR, 'blacklist.txt')  # 黑名单文件路径
+@dataclass
+class CacheData:
+    """缓存数据结构，包含基金数据和时间戳"""
+    df: pd.DataFrame
+    cache_time: datetime
 
-def load_fund_blacklist():
-    """从黑名单文件加载基金代码列表，文件不存在或读取失败时返回空集合"""
-    if not os.path.exists(BLACKLIST_FILE):
-        return set()  # 黑名单文件不存在，返回空集合
-    try:
-        with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
-            # 读取所有行，去除空白字符，跳过空行
-            blacklist = {line.strip() for line in f if line.strip()}
-        return blacklist
-    except Exception as e:
-        print(f"警告: 读取黑名单文件失败: {type(e).__name__}: {e}")
-        return set()  # 读取失败，返回空集合
+@dataclass
+class FundRecord:
+    """单只基金记录数据结构"""
+    code: str
+    date: datetime
+    rate: float
+    df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
-def load_fund_cache(fund_code):
-    """从缓存文件加载基金数据，若缓存不存在或已过期则返回None"""
-    cache_file = os.path.join(CACHE_DIR, f'{fund_code}.pkl')
-    if not os.path.exists(cache_file):
-        return None  # 缓存文件不存在
-    
-    cache_data = pd.read_pickle(cache_file)  # 反序列化读取缓存
-    cache_time = cache_data['cache_time']  # 获取缓存保存时间
-    # 如果缓存保存日期 < 当前日期，则认为已过期
-    if cache_time.date() < datetime.now().date():
-        return None  # 缓存已过期
-    
-    return cache_data['df']  # 返回缓存的基金数据
+class FundDataFetcher:
+    """货币基金数据获取器，封装数据获取、缓存和黑名单管理"""
+    def __init__(self,
+        cache_dir: str,
+        cache_expire_days: int = 1,
+        max_threads: int = 10,
+        blacklist_file: Optional[str] = None
+    ):
+        self.cache_dir = cache_dir
+        self.cache_expire_days = cache_expire_days
+        self.max_threads = max_threads
+        self.blacklist_file = blacklist_file or os.path.join(cache_dir, 'blacklist.txt')
+        self._blacklist: Optional[set] = None
 
-def save_fund_cache(fund_code, df):
-    """保存基金数据到缓存文件"""
-    if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)  # 创建缓存目录（如果不存在）
-    cache_file = os.path.join(CACHE_DIR, f'{fund_code}.pkl')
-    cache_data = {
-        'df': df,  # 基金数据
-        'cache_time': datetime.now()  # 缓存时间
-    }
-    pd.to_pickle(cache_data, cache_file)  # 使用pandas序列化保存
+    def _ensure_cache_dir(self) -> None:
+        """确保缓存目录存在"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
 
-def get_fund_data(fund_code):
-    # 检查是否在黑名单中
-    blacklist = load_fund_blacklist()
-    if fund_code in blacklist:
-        print(f"{fund_code}: 该基金在黑名单中，已跳过")
-        return None
-    
-    # 尝试从缓存加载数据
-    df = load_fund_cache(fund_code)
-    if df is not None:
-        print(f"{fund_code}: 从缓存加载数据")
-        return df
-    
-    try:
-        # 获取对应基金数据
-        df = ak.fund_money_fund_info_em(fund_code)
+    def _load_blacklist(self) -> set:
+        """加载黑名单列表"""
+        if self._blacklist is not None:
+            return self._blacklist
+
+        if not os.path.exists(self.blacklist_file):
+            self._blacklist = set()
+            return self._blacklist
+
+        try:
+            with open(self.blacklist_file, 'r', encoding='utf-8') as f:
+                self._blacklist = {line.strip() for line in f if line.strip()}
+        except Exception as e:
+            print(f"警告: 读取黑名单文件失败: {type(e).__name__}: {e}")
+            self._blacklist = set()
+        return self._blacklist
+
+    def is_blacklisted(self, fund_code: str) -> bool:
+        """检查基金是否在黑名单中"""
+        return fund_code in self._load_blacklist()
+
+    def _load_cache(self, fund_code: str) -> Optional[pd.DataFrame]:
+        """从缓存加载基金数据"""
+        cache_file = os.path.join(self.cache_dir, f'{fund_code}.pkl')
+        if not os.path.exists(cache_file):
+            return None
+
+        try:
+            cache_data: CacheData = pd.read_pickle(cache_file)
+            if cache_data.cache_time.date() < datetime.now().date():
+                return None
+            return cache_data.df
+        except Exception:
+            return None
+
+    def _save_cache(self, fund_code: str, df: pd.DataFrame) -> None:
+        """保存基金数据到缓存"""
+        self._ensure_cache_dir()
+        cache_file = os.path.join(self.cache_dir, f'{fund_code}.pkl')
+        cache_data = CacheData(df=df, cache_time=datetime.now())
+        pd.to_pickle(cache_data, cache_file)
+
+    def _process_fund_data(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """预处理基金数据：列重命名、类型转换、筛选最近一年、计算年化收益率"""
         if df is None or df.empty:
             return None
-        
-        # 数据预处理
-        df.columns = ['净值日期', '每万份收益', '7日年化收益率', '申购状态', '赎回状态']    # 重命名DF列名        
-        df['净值日期'] = pd.to_datetime(df['净值日期'], errors='coerce')  # 转换为PD日期时间类型，解析失败则为NaT
-        df['每万份收益'] = pd.to_numeric(df['每万份收益'], errors='coerce')     # 转换为PD数值类型
-        df = df.dropna(subset=['净值日期', '每万份收益'])       # 删除在 净值日期 或 每万份收益 上为缺失值的行
-        df = df.sort_values('净值日期').reset_index(drop=True)  # 按净值日期排序并重置索引
 
-        # 选择最近一年数据
+        df.columns = ['净值日期', '每万份收益', '7日年化收益率', '申购状态', '赎回状态']
+        df['净值日期'] = pd.to_datetime(df['净值日期'], errors='coerce')
+        df['每万份收益'] = pd.to_numeric(df['每万份收益'], errors='coerce')
+        df = df.dropna(subset=['净值日期', '每万份收益'])
+        df = df.sort_values('净值日期').reset_index(drop=True)
+
         today = datetime.now()
         one_year_ago = today - timedelta(days=365)
         df = df[(df['净值日期'] >= one_year_ago) & (df['净值日期'] <= today)].copy()
+
         if df.empty:
             return None
 
-        # 复利方式计算年化收益率
         df['年化收益率'] = ((1 + df['每万份收益'] / 10000).cumprod() - 1) * 100
-        
-        # 过滤异常数据：年化收益率超过100%的基金可能是数据异常（如万元收益实际是净值）
-        max_reasonable_rate = 100.0  # 货币基金年化收益率正常范围约1%-5%，上限设为100%
-        if df['年化收益率'].iloc[-1] > max_reasonable_rate:
-            print(f"{fund_code}: 数据异常（年化收益率 {df['年化收益率'].iloc[-1]:.2f}%）")
+        return df
+
+    def fetch_single(self, fund_code: str, use_cache: bool = True) -> Optional[FundRecord]:
+        """获取单只基金数据"""
+        if self.is_blacklisted(fund_code):
+            print(f"{fund_code}: 该基金在黑名单中，已跳过")
             return None
 
-        # 保存数据到缓存
-        save_fund_cache(fund_code, df)
-        print(f"{fund_code}: 从API获取数据并更新缓存")
-        return df
-    except Exception as e:
-        print(f"异常: {type(e).__name__}: {e}")
-        return None
+        if use_cache:
+            df = self._load_cache(fund_code)
+            if df is not None:
+                print(f"{fund_code}: 从缓存加载数据")
+                latest = df.iloc[-1]
+                return FundRecord(
+                    code=fund_code,
+                    date=latest['净值日期'],
+                    rate=latest['年化收益率'],
+                    df=df
+                )
 
-def fetch_fund_rate(code):
-    """多线程获取单只基金数据，用于update_mode中的并行获取"""
-    df = get_fund_data(code)
-    if df is None or df.empty:
-        return None
-    latest = df.iloc[-1]
-    return {
-        'code': code,
-        'date': latest['净值日期'],
-        'rate': latest['年化收益率'],
-        'df': df
-    }
+        try:
+            raw_df = ak.fund_money_fund_info_em(fund_code)
+            df = self._process_fund_data(raw_df)
+            if df is None or df.empty:
+                print(f"{fund_code}: 数据为空或处理后无有效数据")
+                return None
 
-def update_mode():
-    """更新模式：获取所有货币基金列表，选取年化收益率最高的前5位对比显示"""
-    print("正在获取所有货币基金列表...")
-    try:
-        all_funds = ak.fund_money_fund_daily_em()  # 获取所有货币基金列表
-        if all_funds is None or all_funds.empty:
-            print("错误：无法获取货币基金列表")
-            return
-        fund_codes = all_funds['基金代码'].tolist()  # 提取基金代码列表
-        print(f"发现 {len(fund_codes)} 只货币基金，开始获取年化收益率...")
-    except Exception as e:
-        print(f"异常: {type(e).__name__}: {e}")
+            self._save_cache(fund_code, df)
+            print(f"{fund_code}: 从API获取数据并更新缓存")
+            latest = df.iloc[-1]
+            return FundRecord(
+                code=fund_code,
+                date=latest['净值日期'],
+                rate=latest['年化收益率'],
+                df=df
+            )
+        except Exception as e:
+            print(f"异常: {type(e).__name__}: {e}")
+            return None
+
+    def fetch_batch(self, fund_codes: list) -> list:
+        """多线程批量获取基金数据"""
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            futures = {executor.submit(self.fetch_single, code): code for code in fund_codes}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+        return results
+
+def plot_funds(
+    funds: list,
+    title: str,
+    figsize: tuple = (12, 8),
+    colors: Optional[list] = None
+) -> None:
+    """绘制基金年化收益率走势图的公共函数
+
+    Args:
+        funds: 基金记录列表
+        title: 图表标题
+        figsize: 图形尺寸
+        colors: 颜色列表，默认使用内置颜色
+    """
+    if not funds:
+        print("错误：无数据可绘制")
         return
-    
-    fund_rates = []
-    count = 0
-    
-    # 使用多线程并行获取基金数据
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        future_to_code = {executor.submit(fetch_fund_rate, code): code for code in fund_codes}
-        for future in as_completed(future_to_code):
-            result = future.result()
-            if result is not None:
-                fund_rates.append(result)
-            count += 1
-            if count % 50 == 0:
-                print(f"已处理 {count} 只基金...")
-    
-    if not fund_rates:
-        print("错误：无可用基金数据")
-        return
-    
-    fund_rates.sort(key=lambda x: x['rate'], reverse=True)
-    top5 = fund_rates[:5]
-    
-    print("\n=== 货币基金年化收益率排名前5 ===")
-    for i, fund in enumerate(top5, 1):
-        print(f"第{i}名: {fund['code']} | 年化收益率: {fund['rate']:.4f}% | 最新日期: {fund['date'].strftime('%Y-%m-%d')}")
-    
-    fig, ax = plt.subplots(figsize=(12, 8))
-    colors = ['red', 'blue', 'green', 'orange', 'purple']
-    
-    for i, fund in enumerate(top5):
-        ax.plot(fund['df']['净值日期'], fund['df']['年化收益率'], 
-                label=fund['code'], linewidth=1.5, color=colors[i])
-        ax.annotate(f"{fund['rate']:.3f}%", 
-                    xy=(fund['date'], fund['rate']),
-                    xytext=(10, 10), textcoords='offset points',
-                    fontsize=9, color=colors[i],
-                    arrowprops=dict(arrowstyle='->', color=colors[i], lw=0.5))
-    
-    ax.set_title("货币基金年化收益率 TOP5 走势", fontsize=14)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    default_colors = ['red', 'blue', 'green', 'orange', 'purple']
+    plot_colors = colors or default_colors[:len(funds)]
+
+    for i, fund in enumerate(funds):
+        color = plot_colors[i % len(plot_colors)]
+        ax.plot(fund.df['净值日期'], fund.df['年化收益率'],
+                label=fund.code, linewidth=1.5, color=color)
+        ax.annotate(
+            f"{fund.rate:.3f}%",
+            xy=(fund.date, fund.rate),
+            xytext=(10, 10),
+            textcoords='offset points',
+            fontsize=9,
+            color=color,
+            arrowprops=dict(arrowstyle='->', color=color, lw=0.5)
+        )
+
+    ax.set_title(title, fontsize=14)
     ax.set_xlabel("日期")
     ax.set_ylabel("年化收益率 (%)")
     ax.legend()
@@ -190,16 +218,52 @@ def update_mode():
     plt.tight_layout()
     plt.show()
 
+def update_mode(fetcher: FundDataFetcher) -> None:
+    """更新模式：获取所有货币基金列表，选取年化收益率最高的前5位对比显示"""
+    print("正在获取所有货币基金列表...")
+    try:
+        all_funds = ak.fund_money_fund_daily_em()
+        if all_funds is None or all_funds.empty:
+            print("错误：无法获取货币基金列表")
+            return
+        fund_codes = all_funds['基金代码'].tolist()
+        print(f"发现 {len(fund_codes)} 只货币基金，开始获取年化收益率...")
+    except Exception as e:
+        print(f"异常: {type(e).__name__}: {e}")
+        return
+
+    fund_rates = fetcher.fetch_batch(fund_codes)
+    if not fund_rates:
+        print("错误：无可用基金数据")
+        return
+
+    fund_rates.sort(key=lambda x: x.rate, reverse=True)
+    top5 = fund_rates[:5]
+
+    print("\n=== 货币基金年化收益率排名前5 ===")
+    for i, fund in enumerate(top5, 1):
+        print(f"第{i}名: {fund.code} | 年化收益率: {fund.rate:.4f}% | 最新日期: {fund.date.strftime('%Y-%m-%d')}")
+
+    plot_funds(top5, "货币基金年化收益率 TOP5 走势")
+
 def main():
+    """主函数：货币基金年化收益率对比工具入口"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fetcher = FundDataFetcher(
+        cache_dir=os.path.join(script_dir, 'Database'),
+        cache_expire_days=1,
+        max_threads=10
+    )
+
     print("=" * 40)
     print("货币基金年化收益率对比工具")
     print("=" * 40)
     print("1. 自填模式：手动输入基金代码进行对比")
     print("2. 更新模式：自动获取全市场货币基金，取年化收益率前5名")
     print("=" * 40)
-    
+
     mode = input("请选择模式（1/2）：").strip()
-    
+
     if mode == '1':
         codes_input = input("请输入基金代码（逗号分隔）：").strip()
         if not codes_input:
@@ -211,39 +275,26 @@ def main():
             print("错误：未输入有效的基金代码")
             return
 
-        fig, ax = plt.subplots(figsize=(12, 8))
-
+        funds = []
         for code in fund_codes:
             print(f"正在获取 {code} ...")
-            df = get_fund_data(code)
-            if df is None or df.empty:
-                print(f"{code} 数据获取失败")
-                continue
+            fund = fetcher.fetch_single(code)
+            if fund is not None:
+                funds.append(fund)
+                print(f"{code}: 最新日期 {fund.date.strftime('%Y-%m-%d')}, "
+                      f"每万份收益 {fund.df.iloc[-1]['每万份收益']:.4f}, "
+                      f"年化收益率 {fund.rate:.4f}%")
+            else:
+                print(f"{code}: 数据获取失败")
 
-            ax.plot(df['净值日期'], df['年化收益率'], label=code, linewidth=1.5)
-            latest = df.iloc[-1]
-            ax.annotate(f'{latest["年化收益率"]:.3f}%', 
-                        xy=(latest['净值日期'], latest['年化收益率']),
-                        xytext=(10, 10), textcoords='offset points',
-                        fontsize=9, color='blue',
-                        arrowprops=dict(arrowstyle='->', color='blue', lw=0.5))
-            print(f"{code}: 最新日期 {latest['净值日期'].strftime('%Y-%m-%d')}, "
-                  f"每万份收益 {latest['每万份收益']:.4f}, "
-                  f"年化收益率 {latest['年化收益率']:.4f}%")
-
-        ax.set_title("货币基金年化收益率走势", fontsize=14)
-        ax.set_xlabel("日期")
-        ax.set_ylabel("年化收益率 (%)")
-        if ax.get_legend_handles_labels()[1]:
-            ax.legend()
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
+        if funds:
+            plot_funds(funds, "货币基金年化收益率走势")
+        else:
+            print("错误：没有任何基金数据获取成功")
     elif mode == '2':
-        update_mode()
+        update_mode(fetcher)
     else:
         print("无效的选择，请输入 1 或 2")
 
 if __name__ == "__main__":
-    # print("AKshare安装成功, 版本号:", ak.__version__)
     main()
